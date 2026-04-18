@@ -6,9 +6,14 @@ Runs CLI programs (Claude Code, Codex, bash, etc.) in a PTY that survives
 SSH disconnects. On reconnect, replays missed output from a ring buffer.
 
 Usage:
-    broker.py session <name> [command...] [--cwd PATH]  — connect to session (create if needed)
+    broker.py session <name> [command...] [--cwd PATH] [--suspend-after SEC]
+                                                        — connect to session (create if needed)
     broker.py list [--json]                             — list active sessions
     broker.py kill <name>                               — terminate a session
+
+--suspend-after: seconds of idle (no clients) before the child process group
+    is SIGSTOP'd; default 300, pass 0 to never suspend (for builds, dev servers).
+    Only honored on session creation — ignored if the session already exists.
 
 Session logic:
     - Session doesn't exist        → create + attach
@@ -57,6 +62,32 @@ DETACH_KEY = b'\x1c'  # Ctrl+\ to detach
 AI_COMMANDS = {"claude", "codex"}  # commands that produce AI sessions
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 AI_SCAN_INTERVAL = 30  # seconds between AI session scans
+SUSPEND_GRACE_SEC = 300  # default grace period (sec) before SIGSTOP'ing a detached session; 0 = never suspend
+
+# Per-CLI overrides applied at child exec to suppress background noise (auto-updaters
+# etc.) that would otherwise spam the PTY when nobody is reading. Matched by basename(cmd[0]).
+CLI_OVERRIDES: dict[str, dict] = {
+    "claude":  {"env": {"DISABLE_AUTOUPDATER": "1"}},
+    "copilot": {"args": ["--no-auto-update"]},
+}
+
+
+def apply_cli_overrides(command: list[str], env: dict[str, str]) -> list[str]:
+    """Merge env/args overrides for known CLIs into place. Returns the final command."""
+    if not command:
+        return command
+    name = os.path.basename(command[0])
+    override = CLI_OVERRIDES.get(name)
+    if not override:
+        return command
+
+    for k, v in override.get("env", {}).items():
+        env[k] = v
+
+    extra_args = [a for a in override.get("args", []) if a not in command]
+    if extra_args:
+        command = [command[0]] + extra_args + command[1:]
+    return command
 
 
 def setup_logger(name: str) -> logging.Logger:
@@ -77,6 +108,14 @@ def setup_logger(name: str) -> logging.Logger:
 class RingBuffer:
     """Fixed-size ring buffer for terminal output."""
 
+    # Terminal sequences that indicate a "safe" replay point —
+    # after these, the terminal state is fully reset or screen is cleared.
+    SAFE_SEQUENCES = [
+        b'\033c',            # Full terminal reset (RIS)
+        b'\033[2J\033[H',    # Clear screen + cursor home (common combo)
+        b'\033[H\033[2J',    # Cursor home + clear screen (alternate order)
+    ]
+
     def __init__(self, capacity=BUFFER_SIZE):
         self.capacity = capacity
         self.buf = bytearray()
@@ -92,6 +131,27 @@ class RingBuffer:
     def read_all(self) -> bytes:
         return bytes(self.buf)
 
+    def read_from_safe_point(self) -> bytes:
+        """Return buffer contents starting from the last safe replay point.
+
+        Scans backwards for terminal reset / screen clear sequences.
+        If none found, returns the whole buffer (better than nothing).
+        """
+        data = bytes(self.buf)
+        if not data:
+            return data
+
+        # Search for the last occurrence of each safe sequence
+        best_pos = -1
+        for seq in self.SAFE_SEQUENCES:
+            pos = data.rfind(seq)
+            if pos > best_pos:
+                best_pos = pos
+
+        if best_pos > 0:
+            return data[best_pos:]
+        return data
+
     def size(self) -> int:
         return len(self.buf)
 
@@ -99,7 +159,8 @@ class RingBuffer:
 class SessionDaemon:
     """Daemon process that holds a PTY and serves clients via Unix socket."""
 
-    def __init__(self, name: str, command: list[str], cwd: str | None = None):
+    def __init__(self, name: str, command: list[str], cwd: str | None = None,
+                 suspend_after: int = SUSPEND_GRACE_SEC):
         self.name = name
         self.command = command
         self.cwd = cwd or os.getcwd()
@@ -114,6 +175,12 @@ class SessionDaemon:
         self.is_ai_command = command[0] in AI_COMMANDS if command else False
         self.last_ai_scan = 0.0
         self.log: logging.Logger | None = None  # initialized after fork
+        # Auto-suspend state: freeze child's process group when no clients read.
+        # suspend_after == 0 disables the mechanism entirely (e.g. builds, dev servers).
+        self.suspend_after = suspend_after
+        self.was_attached = False
+        self.suspended = False
+        self.last_disconnect_time: float | None = None
 
     def start(self):
         """Fork into background daemon and start the session."""
@@ -144,6 +211,7 @@ class SessionDaemon:
             "cwd": self.cwd,
             "pid": os.getpid(),
             "created": time.time(),
+            "suspend_after": self.suspend_after,
             "ai_sessions": [],
         }
         self.meta_path.write_text(json.dumps(meta))
@@ -165,7 +233,8 @@ class SessionDaemon:
             env["TERM"] = "xterm-256color"
             env["DEVOLUTION_BROKER_META"] = str(self.meta_path)
             env["DEVOLUTION_BROKER_SESSION"] = self.name
-            os.execvpe(self.command[0], self.command, env)
+            final_cmd = apply_cli_overrides(self.command, env)
+            os.execvpe(final_cmd[0], final_cmd, env)
 
         self.log.info("Child forked: child_pid=%d master_fd=%d", self.child_pid, self.master_fd)
 
@@ -220,6 +289,14 @@ class SessionDaemon:
                     self.last_ai_scan = now
                     self._scan_ai_sessions()
 
+            # Auto-suspend: freeze child's process group if idle past grace period.
+            # Only engages after at least one client attached (preserves unattended background jobs).
+            # suspend_after == 0 means the mechanism is disabled for this session.
+            if (self.suspend_after > 0 and self.was_attached and not self.suspended
+                    and not self.clients and self.last_disconnect_time is not None
+                    and time.time() - self.last_disconnect_time >= self.suspend_after):
+                self._suspend_child()
+
     def _accept_client(self, server: socket.socket):
         """Accept new client connection and send ring buffer."""
         try:
@@ -228,6 +305,11 @@ class SessionDaemon:
             self.log.warning("Accept failed: %s", e)
             return
         self.log.info("Client connected (total: %d)", len(self.clients) + 1)
+
+        # Resume the child's process group if it was frozen waiting for a reader
+        if self.suspended:
+            self._resume_child()
+        self.last_disconnect_time = None
 
         try:
             # Read terminal size from client: 'S' + rows(2B) + cols(2B)
@@ -239,14 +321,20 @@ class SessionDaemon:
             else:
                 self.log.warning("Client handshake failed: header=%r", header)
 
-            # Send ring buffer
-            data = self.buffer.read_all()
-            length = struct.pack('!I', len(data))
-            conn.sendall(length + data)
-            self.log.debug("Sent ring buffer: %d bytes", len(data))
+            # Send ring buffer with terminal reset prefix
+            # Reset terminal state before replay to avoid corrupted display
+            # from partial escape sequences at the start of the buffer
+            TERM_RESET = b'\033c\033[0m'  # Full reset + clear attributes
+            replay_data = self.buffer.read_from_safe_point()
+            payload = TERM_RESET + replay_data
+            length = struct.pack('!I', len(payload))
+            conn.sendall(length + payload)
+            self.log.debug("Sent ring buffer: %d bytes (safe point), %d bytes total in buffer",
+                           len(replay_data), self.buffer.size())
 
             conn.setblocking(False)
             self.clients.append(conn)
+            self.was_attached = True
         except (OSError, BrokenPipeError) as e:
             self.log.warning("Client dropped during handshake: %s", e)
             conn.close()
@@ -297,6 +385,8 @@ class SessionDaemon:
             self.clients.remove(client)
             client.close()
             self.log.info("Client disconnected (broken pipe, remaining: %d)", len(self.clients))
+        if dead and self.was_attached and not self.clients:
+            self.last_disconnect_time = time.time()
 
     def _read_client(self, client: socket.socket):
         """Read input from client and forward to PTY."""
@@ -310,6 +400,8 @@ class SessionDaemon:
             self.clients.remove(client)
             client.close()
             self.log.info("Client disconnected (EOF, remaining: %d)", len(self.clients))
+            if self.was_attached and not self.clients:
+                self.last_disconnect_time = time.time()
             return
 
         # Process control sequences (0x00 prefix)
@@ -387,15 +479,44 @@ class SessionDaemon:
         except OSError as e:
             self.log.warning("AI scan error: %s", e)
 
+    def _suspend_child(self):
+        """SIGSTOP the child's process group to stop runaway writes while detached."""
+        if self.suspended or self.child_pid <= 0:
+            return
+        try:
+            os.killpg(self.child_pid, signal.SIGSTOP)
+            self.suspended = True
+            self.log.info("Child suspended (SIGSTOP) after %ds idle: pgid=%d",
+                          self.suspend_after, self.child_pid)
+        except (OSError, ProcessLookupError) as e:
+            self.log.warning("SIGSTOP failed: %s", e)
+
+    def _resume_child(self):
+        """SIGCONT the child's process group when a reader reconnects."""
+        if not self.suspended or self.child_pid <= 0:
+            return
+        try:
+            os.killpg(self.child_pid, signal.SIGCONT)
+            self.suspended = False
+            self.log.info("Child resumed (SIGCONT): pgid=%d", self.child_pid)
+        except (OSError, ProcessLookupError) as e:
+            self.log.warning("SIGCONT failed: %s", e)
+
     def _on_child_exit(self, signum, frame):
-        """Handle child process exit."""
+        """Handle child process exit. Ignores SIGCHLD from stop/continue state changes."""
         try:
             pid, status = os.waitpid(self.child_pid, os.WNOHANG)
-            if self.log:
-                self.log.info("Child exited: pid=%d status=%d", pid, status)
         except ChildProcessError:
             if self.log:
                 self.log.info("Child already reaped")
+            self.running = False
+            return
+        # pid == 0 means the child is still alive (SIGCHLD fired for stop/continue,
+        # not for exit). Do NOT shut the daemon down in that case.
+        if pid == 0:
+            return
+        if self.log:
+            self.log.info("Child exited: pid=%d status=%d", pid, status)
         self.running = False
 
     def _on_terminate(self, signum, frame):
@@ -425,6 +546,9 @@ class SessionDaemon:
             pass
 
         try:
+            # Unfreeze first so SIGTERM can be delivered & handled, not queued behind SIGSTOP
+            if self.suspended:
+                os.killpg(self.child_pid, signal.SIGCONT)
             os.kill(self.child_pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
@@ -556,15 +680,19 @@ def attach_session(name: str):
         conn.close()
 
 
-def session_command(name: str, command: list[str], cwd: str | None = None):
+def session_command(name: str, command: list[str], cwd: str | None = None,
+                    suspend_after: int = SUSPEND_GRACE_SEC,
+                    suspend_after_given: bool = False):
     """Smart session management: create if needed, always attach."""
     if is_session_alive(name):
+        if suspend_after_given:
+            print(f"Note: --suspend-after ignored, session '{name}' already running.", file=sys.stderr)
         print(f"Attaching to session '{name}'...")
     else:
         # Clean up stale files if any
         cleanup_dead_session(name)
         print(f"Creating session '{name}': {' '.join(command)}")
-        daemon = SessionDaemon(name, command, cwd=cwd)
+        daemon = SessionDaemon(name, command, cwd=cwd, suspend_after=suspend_after)
         daemon.start()
 
     # Wait for socket to appear (daemon needs time to set up)
@@ -623,6 +751,7 @@ def list_sessions(as_json: bool = False):
                 "created": meta["created"],
                 "uptime_seconds": int(uptime),
                 "cwd": meta.get("cwd", ""),
+                "suspend_after": meta.get("suspend_after", SUSPEND_GRACE_SEC),
                 "ai_sessions": meta.get("ai_sessions", []),
             }
             result.append(entry)
@@ -635,13 +764,14 @@ def list_sessions(as_json: bool = False):
         if not result:
             print("No sessions.")
             return
-        print(f"{'NAME':<20} {'COMMAND':<30} {'PID':<10} {'UPTIME'}")
-        print("-" * 75)
+        print(f"{'NAME':<20} {'COMMAND':<30} {'PID':<10} {'UPTIME':<10} {'SUSPEND'}")
+        print("-" * 85)
         for s in result:
             hours = s["uptime_seconds"] // 3600
             minutes = (s["uptime_seconds"] % 3600) // 60
             cmd = " ".join(s["command"])
-            print(f"{s['name']:<20} {cmd:<30} {s['pid']:<10} {hours}h {minutes}m")
+            suspend = "never" if s["suspend_after"] == 0 else f"{s['suspend_after']}s"
+            print(f"{s['name']:<20} {cmd:<30} {s['pid']:<10} {f'{hours}h {minutes}m':<10} {suspend}")
 
 
 def kill_session(name: str):
@@ -688,8 +818,30 @@ def main():
                 print("--cwd requires a path argument", file=sys.stderr)
                 sys.exit(1)
 
+        # Extract --suspend-after from args (seconds; 0 disables auto-suspend)
+        suspend_after = SUSPEND_GRACE_SEC
+        suspend_after_given = False
+        if "--suspend-after" in args:
+            idx = args.index("--suspend-after")
+            if idx + 1 < len(args):
+                try:
+                    suspend_after = int(args[idx + 1])
+                    if suspend_after < 0:
+                        raise ValueError("negative")
+                except ValueError:
+                    print("--suspend-after requires a non-negative integer (seconds; 0 = never)",
+                          file=sys.stderr)
+                    sys.exit(1)
+                args = args[:idx] + args[idx + 2:]
+                suspend_after_given = True
+            else:
+                print("--suspend-after requires a numeric argument (seconds; 0 = never)",
+                      file=sys.stderr)
+                sys.exit(1)
+
         command = args if args else ["/bin/bash"]
-        session_command(name, command, cwd=cwd)
+        session_command(name, command, cwd=cwd, suspend_after=suspend_after,
+                        suspend_after_given=suspend_after_given)
 
     elif cmd == "list" or cmd == "ls":
         list_sessions(as_json="--json" in sys.argv)
